@@ -28,6 +28,8 @@ class RequestResult:
     total_s: float
     ttfb_s: float | None
     resp_bytes: int
+    processing_s: float | None
+    chunk_count: int | None
     error: str
 
 
@@ -81,6 +83,16 @@ async def send_one(
             total_s = time.perf_counter() - start
             ok = status == 200
             error = "" if ok else f"http_{status}"
+            processing_raw = resp.headers.get("X-Processing-Time", "").strip()
+            chunk_raw = resp.headers.get("X-Chunk-Count", "").strip()
+            try:
+                processing_s = float(processing_raw) if processing_raw else None
+            except ValueError:
+                processing_s = None
+            try:
+                chunk_count = int(chunk_raw) if chunk_raw else None
+            except ValueError:
+                chunk_count = None
             return RequestResult(
                 level=level,
                 req_id=req_id,
@@ -89,14 +101,16 @@ async def send_one(
                 total_s=total_s,
                 ttfb_s=ttfb_s,
                 resp_bytes=size,
+                processing_s=processing_s,
+                chunk_count=chunk_count,
                 error=error,
             )
     except asyncio.TimeoutError:
         total_s = time.perf_counter() - start
-        return RequestResult(level, req_id, 0, False, total_s, ttfb_s, 0, "timeout")
+        return RequestResult(level, req_id, 0, False, total_s, ttfb_s, 0, None, None, "timeout")
     except Exception as exc:
         total_s = time.perf_counter() - start
-        return RequestResult(level, req_id, 0, False, total_s, ttfb_s, 0, str(exc))
+        return RequestResult(level, req_id, 0, False, total_s, ttfb_s, 0, None, None, str(exc))
 
 
 async def run_level(
@@ -132,6 +146,7 @@ async def run_level(
     fails = [r for r in results if not r.ok]
     totals = sorted(r.total_s for r in results)
     ttfbs = sorted(r.ttfb_s for r in results if r.ttfb_s is not None)
+    processing_times = sorted(r.processing_s for r in results if r.processing_s is not None)
 
     status_counts: dict[str, int] = {}
     for r in results:
@@ -153,6 +168,8 @@ async def run_level(
         "latency_p99_s": percentile(totals, 0.99),
         "latency_max_s": max(totals) if totals else 0.0,
         "ttfb_avg_s": statistics.mean(ttfbs) if ttfbs else 0.0,
+        "processing_avg_s": statistics.mean(processing_times) if processing_times else 0.0,
+        "processing_p95_s": percentile(processing_times, 0.95),
         "status_counts": status_counts,
     }
     return results, summary
@@ -202,6 +219,40 @@ def print_summary_row(s: dict[str, Any]) -> None:
     )
 
 
+def print_final_summary(base_url: str, ping: PingResult, summaries: list[dict[str, Any]]) -> None:
+    print("\n=== Final Summary ===")
+    print(
+        "base_url={base} ping_status={status} ping_total={total:.3f}s ping_ttfb={ttfb:.3f}s".format(
+            base=base_url,
+            status=ping.status,
+            total=ping.total_s,
+            ttfb=ping.ttfb_s or 0.0,
+        )
+    )
+    print(
+        "lvl req ok fail succ% rps lat_avg p95 p99 max ttfb_avg proc_avg proc_p95\n"
+        "--- --- -- ---- ----- --- ------- --- --- --- -------- -------- --------"
+    )
+    for s in summaries:
+        print(
+            "{lvl:>3} {req:>3} {ok:>2} {fail:>4} {succ:>5.1f} {rps:>3.1f} {avg:>7.3f} {p95:>3.3f} {p99:>3.3f} {mx:>3.3f} {ttfb:>8.3f} {pavg:>8.3f} {pp95:>8.3f}".format(
+                lvl=s["concurrency"],
+                req=s["requests"],
+                ok=s["ok"],
+                fail=s["failed"],
+                succ=s["success_rate"],
+                rps=s["rps"],
+                avg=s["latency_avg_s"],
+                p95=s["latency_p95_s"],
+                p99=s["latency_p99_s"],
+                mx=s["latency_max_s"],
+                ttfb=s["ttfb_avg_s"],
+                pavg=s.get("processing_avg_s", 0.0),
+                pp95=s.get("processing_p95_s", 0.0),
+            )
+        )
+
+
 def ensure_auth(api_key: str) -> str:
     key = api_key.strip()
     if not key:
@@ -209,6 +260,26 @@ def ensure_auth(api_key: str) -> str:
     if key in {"rp_xxx", "rpa_xxx", "YOUR_API_KEY"}:
         raise ValueError("RUNPOD_API_KEY looks like a placeholder")
     return key
+
+
+def load_dotenv() -> None:
+    dotenv_candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    for dotenv_path in dotenv_candidates:
+        if not dotenv_path.exists():
+            continue
+        for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        break
 
 
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -223,11 +294,12 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv()
     p = argparse.ArgumentParser(description="Runpod /tts concurrency load test")
     p.add_argument("--base-url", required=True, help="Endpoint base URL, e.g. https://<id>.api.runpod.ai")
     p.add_argument(
         "--levels",
-        default="1,10,50,100",
+        default="1,10, 50,100",
         help="Comma-separated concurrency levels",
     )
     p.add_argument(
@@ -329,18 +401,35 @@ async def main_async() -> int:
 
     with requests_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["level", "req_id", "status", "ok", "total_s", "ttfb_s", "resp_bytes", "error"])
+        writer.writerow(
+            [
+                "level",
+                "req_id",
+                "status",
+                "ok",
+                "total_s",
+                "ttfb_s",
+                "processing_s",
+                "chunk_count",
+                "resp_bytes",
+                "error",
+            ]
+        )
         for r in all_results:
-            writer.writerow([
-                r.level,
-                r.req_id,
-                r.status,
-                int(r.ok),
-                f"{r.total_s:.6f}",
-                "" if r.ttfb_s is None else f"{r.ttfb_s:.6f}",
-                r.resp_bytes,
-                r.error,
-            ])
+            writer.writerow(
+                [
+                    r.level,
+                    r.req_id,
+                    r.status,
+                    int(r.ok),
+                    f"{r.total_s:.6f}",
+                    "" if r.ttfb_s is None else f"{r.ttfb_s:.6f}",
+                    "" if r.processing_s is None else f"{r.processing_s:.6f}",
+                    "" if r.chunk_count is None else r.chunk_count,
+                    r.resp_bytes,
+                    r.error,
+                ]
+            )
 
     with levels_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -360,6 +449,8 @@ async def main_async() -> int:
                 "latency_p99_s",
                 "latency_max_s",
                 "ttfb_avg_s",
+                "processing_avg_s",
+                "processing_p95_s",
                 "status_counts",
             ]
         )
@@ -380,6 +471,8 @@ async def main_async() -> int:
                     f"{s['latency_p99_s']:.6f}",
                     f"{s['latency_max_s']:.6f}",
                     f"{s['ttfb_avg_s']:.6f}",
+                    f"{s['processing_avg_s']:.6f}",
+                    f"{s['processing_p95_s']:.6f}",
                     json.dumps(s["status_counts"], ensure_ascii=True),
                 ]
             )
@@ -416,6 +509,7 @@ async def main_async() -> int:
     print(f"- {requests_path}")
     print(f"- {levels_path}")
     print(f"- {summary_path}")
+    print_final_summary(args.base_url, ping, all_summaries)
     return 0
 
 
